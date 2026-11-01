@@ -4,11 +4,10 @@
 
 [Script]
 # API 持久化存储脚本 (负责保存你的装扮设置)
-哔哩主题API = type=http-request, pattern=^https:\/\/app\.bilibili\.com\/settings\/theme\/api\/(select|config), requires-body=1, max-size=0, script-path=https://raw.githubusercontent.com/chaoscard/bili-theme/main/dist/bili-theme.panel.js
+哔哩主题API = type=http-request, pattern=^https:\/\/app\.bilibili\.com\/settings\/theme\/api\/(select|config), requires-body=1, max-size=0, script-path=https://raw.githubusercontent.com/asd3739058-tech/surge-rules/refs/heads/main/bili-api.js
 
 # 核心响应注入脚本 (负责下发装扮数据)
 # 这里的 argument="spaceBg=true,splashBg=true" 表示强制同时开启空间头图和开屏装扮
-哔哩主题响应 = type=http-response, pattern=^https:\/\/(www\.bilibili\.com\/h5\/mall\/(digital-card\/home|suit\/detail)|app\.bilibili\.com\/x\/(resource\/show\/skin|v2\/(space|splash\/brand\/list))), requires-body=1, max-size=0, argument="spaceBg=true,splashBg=true", script-path=https://raw.githubusercontent.com/chaoscard/bili-theme/main/dist/bili-theme.response.js
-
+哔哩主题响应 = type=http-response, pattern=^https:\/\/(www\.bilibili\.com\/h5\/mall\/(digital-card\/home|suit\/detail)|app\.bilibili\.com\/x\/(resource\/show\/skin|v2\/(space|splash\/brand\/list))), requires-body=1, max-size=0, argument="spaceBg=true,splashBg=true", script-path=https://raw.githubusercontent.com/asd3739058-tech/surge-rules/refs/heads/main/bili-response.js%E2%81%A0
 [MITM]
 hostname = %APPEND% app.bilibili.com, www.bilibili.com
