@@ -1,0 +1,331 @@
+/* 由 tools/build.js 生成：响应改写脚本 */
+/**
+ * BiliTheme: Theme Response
+ * 哔哩主题 — 官方装扮商城详情页原生衣服图标一键注入（三端通用）
+ *
+ * 拦截范围:
+ *   www.bilibili.com/h5/mall/(digital-card/home|suit/detail) → 原生衣服图标接管与注入
+ *   app.bilibili.com/x/resource/show/skin                   → 注入主题皮肤 + 加载动画
+ *   app.bilibili.com/x/v2/space                             → 注入个人空间头图
+ *   app.bilibili.com/x/v2/splash/brand/list                 → 注入开屏画面装扮
+ *
+ * 存储结构:
+ *   $persistentStore["BiliTheme"] = { item_id, name, ids, cover }
+ *
+ * MITM hostname: app.bilibili.com, www.bilibili.com
+ */
+const VERSION = "3.2.12";
+const STORAGE_ROOT = "BiliTheme";
+let modified = false;
+
+/* **************** 平台适配层 **************** */
+const $app = typeof $loon !== "undefined" ? "Loon"
+	: typeof $environment !== "undefined" && $environment["surge-version"] ? "Surge"
+	: typeof $task !== "undefined" ? "Quantumult X"
+	: typeof $environment !== "undefined" && $environment["stash-version"] ? "Stash"
+	: "Unknown";
+
+function storeRead(root) {
+	let raw;
+	if ($app === "Quantumult X") raw = $prefs.valueForKey(root);
+	else raw = $persistentStore.read(root);
+	if (typeof raw !== "string") return raw ?? {};
+	try { return JSON.parse(raw); } catch { return {}; }
+}
+function storeWrite(root, obj) {
+	const raw = JSON.stringify(obj);
+	if ($app === "Quantumult X") return $prefs.setValueForKey(raw, root);
+	return $persistentStore.write(raw, root);
+}
+
+/* **************** 配置读取 **************** */
+function getTheme() {
+	const d = storeRead(STORAGE_ROOT);
+	if (d && typeof d === "object") {
+		if (d.item_id) return d;
+		if (d.config && d.config.skin && d.config.skin.item_id) return d.config.skin;
+	}
+	return null;
+}
+function getSettings() {
+	const theme = getTheme();
+	return { Switch: !!theme, Skin: theme || {} };
+}
+
+/* **************** garb API **************** */
+const GARB_BENEFIT = "https://api.bilibili.com/x/garb/v2/user/suit/benefit?item_id=";
+const GARB_SUIT_DETAIL = "https://api.bilibili.com/x/garb/v2/mall/suit/detail?item_id=";
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+const validStr = (s) => (typeof s === "string" && s.trim() ? s.trim() : null);
+
+/**
+ * 从单个 item 数据里探测可见部件:
+ *   普通装扮: suit_items.{skin,loading,space_bg}[0].properties
+ *   卡池单品: 顶层 properties
+ */
+function extractParts(d) {
+	const si = (d && d.suit_items) || {};
+	const pick = (k) => (Array.isArray(si[k]) ? si[k][0] : si[k]) || null;
+	const p = (d && d.properties) || {};
+	const own = { item_id: String(d?.item_id ?? ""), name: d?.name || "", properties: p };
+	const gSkin = pick("skin");
+	const skin = gSkin?.properties?.package_url ? gSkin : (p.package_url ? own : null);
+	const gLoad = pick("loading");
+	const loading = gLoad?.properties?.loading_url ? gLoad : (p.loading_url ? own : null);
+	const gBg = pick("space_bg");
+	const bp = gBg?.properties || {};
+	const spaceBg = (bp.image1_landscape || bp.image1_portrait || gBg?.images) ? gBg
+		: ((p.image1_landscape || p.image1_portrait || d?.images) ? own : null);
+	return { skin, loading, spaceBg };
+}
+
+/**
+ * 提取 space_bg 中的多套图片列表 [{ landscape, portrait, isFallback? }]
+ * 1. 若本身包含 images 数组（如自定义/导入结构），直接转换返回；
+ * 2. 扫描平铺键 image1..image9（官方标准格式）；
+ * 3. 兜底策略（方案 B）: 扫描 skin.properties.head_myself_squared_bg，用于无独立 space_bg 的单品/动态主题。
+ */
+function extractAllSpaceImages(spaceBg, skin) {
+	const images = [];
+	// 1. 若已有 images 数组
+	const directList = spaceBg?.images || spaceBg?.properties?.images;
+	if (Array.isArray(directList) && directList.length > 0) {
+		for (const img of directList) {
+			const land = img.landscape || img.portrait;
+			const port = img.portrait || img.landscape;
+			if (land || port) images.push({ landscape: land, portrait: port });
+		}
+		if (images.length > 0) return images.slice(0, 15);
+	}
+	// 2. 扫描平铺键 image1..image15（对齐官方 App 空间头图 15 张上限）
+	const sp = spaceBg?.properties || {};
+	for (let i = 1; i <= 15; i++) {
+		const land = sp[`image${i}_landscape`]; 	const port = sp[`image${i}_portrait`];
+		if (land || port) {
+			images.push({
+				landscape: land || port,
+				portrait: port || land,
+			});
+		}
+	}
+	if (images.length > 0) return images.slice(0, 15);
+	// 3. 方案 B 智能多级兜底（用于无独立 space_bg 的单品/动态主题）:
+	//    优先: head_myself_squared_bg（老版单品大图，如双鱼座）
+	//    次选: image_cover || image_preview（装扮官方主视觉封面，如终冕）
+	//    末选: cover（装扮顶层封面）
+	const skinP = skin?.properties || {};
+	const fallback = validStr(skinP.head_myself_squared_bg)
+		|| validStr(skinP.image_cover)
+		|| validStr(skinP.image_preview)
+		|| validStr(skin?.cover)
+		|| null;
+	if (fallback) {
+		images.push({ landscape: fallback, portrait: fallback, isFallback: true });
+	}
+	return images;
+}
+
+/** 拉单个 item 完整数据：benefit 优先（卡池单品唯一可用），失败回落 mall/suit/detail */
+async function fetchItemFull(id) {
+	let j = await httpGet(GARB_BENEFIT + id + "&part=emoji_package");
+	if (j && j.code === 0 && j.data && (j.data.suit_items !== undefined || j.data.properties)) return j.data;
+	j = await httpGet(GARB_SUIT_DETAIL + id + "&part=suit");
+	if (j && j.code === 0 && j.data) return j.data;
+	return null;
+}
+
+/**
+ * 获取套装数据。
+ * 按 ids（同套装多个部件 item）逐个探测后合并；仅保留皮肤/加载动画/空间头图三组。
+ */
+async function fetchSuit(itemId, ids) {
+	const uniq = [...new Set((ids && ids.length ? ids : [itemId]).map(String).filter(Boolean))];
+	const parts = { skin: null, loading: null, spaceBg: null };
+	let name = "";
+	for (const id of uniq) {
+		const item = await fetchItemFull(id);
+		if (!item) continue;
+		const p = extractParts(item);
+		if (!parts.skin && p.skin) { parts.skin = p.skin; name = item.name || ""; }
+		if (!parts.loading && p.loading) parts.loading = p.loading;
+		if (!parts.spaceBg && p.spaceBg) parts.spaceBg = p.spaceBg;
+	}
+	if (!parts.skin || !parts.skin.properties?.package_url) return null;
+	return {
+		name: name || parts.skin.name || String(itemId),
+		item_id: String(parts.skin.item_id || itemId),
+		ids: uniq,
+		skin: parts.skin,
+		loading: parts.loading,
+		space_bg: parts.spaceBg,
+	};
+}
+
+/** 跨平台 HTTP GET JSON */
+function httpGet(url, timeoutMs = 8000) {
+	return new Promise((resolve) => {
+		let settled = false, timer = null;
+		const fin = (v) => { if (settled) return; settled = true; if (timer) { try { clearTimeout(timer); } catch {} } resolve(v); };
+		const ok = (text) => { try { fin(JSON.parse(text)); } catch { fin(null); } };
+		if (typeof setTimeout === "function") timer = setTimeout(() => fin(null), timeoutMs);
+		const done = (err, resp, data) => {
+			if (err) return fin(null);
+			const body = typeof data === "string" ? data : (typeof resp?.body === "string" ? resp.body : null);
+			if (body == null) return fin(null);
+			ok(body);
+		};
+		if ($app === "Quantumult X") {
+			$task.fetch({ url, headers: { "User-Agent": UA } }).then((resp) => ok(resp?.body), () => fin(null));
+		} else {
+			$httpClient.get({ url, headers: { "User-Agent": UA } }, done);
+		}
+	});
+}
+
+/* **************** 注入: 原生衣服图标接管 **************** */
+const DETAIL_INJECT_SNIPPET = `<style id="bili-theme-inject-style">
+.bt-toast{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) scale(.9);background:rgba(20,20,20,.88);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.15);color:#fff;padding:13px 20px;border-radius:14px;z-index:1000000;pointer-events:none;opacity:0;transition:all .22s cubic-bezier(.2,.8,.2,1);box-shadow:0 8px 32px rgba(0,0,0,.45);text-align:center;width:max-content;max-width:92vw;box-sizing:border-box}
+.bt-toast.bt-show{opacity:1;transform:translate(-50%,-50%) scale(1)}
+.bt-toast-title{font-size:14.5px;font-weight:600;color:#fff;line-height:1.4}
+.bt-toast-name{font-size:13px;font-weight:500;color:rgba(255,255,255,.88);margin-top:4px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.bt-toast-tip{font-size:13px;font-weight:500;color:rgba(255,255,255,.8);margin-top:5px;line-height:1.4}
+</style>
+<div class="bt-toast" id="btToast">
+  <div class="bt-toast-title" id="btToastTitle"></div>
+  <div class="bt-toast-name" id="btToastName"></div>
+  <div class="bt-toast-tip" id="btToastTip"></div>
+</div>
+<script>
+(function(){
+if(window.__biliThemeInjected)return;
+window.__biliThemeInjected=true;
+var cur=null;
+var curActiveLotteryId=null;
+function toast(title,name,tip){
+  var t=document.getElementById("btToast");var tt=document.getElementById("btToastTitle");var tn=document.getElementById("btToastName");var tp=document.getElementById("btToastTip");
+  if(!t||!tt)return;
+  tt.textContent=title||"";
+  if(tn){tn.textContent=name||"";tn.style.display=name?"block":"none";}
+  if(tp){tp.textContent=tip||"";tp.style.display=tip?"block":"none";}
+  t.classList.add("bt-show");
+  clearTimeout(t._tm);
+  t._tm=setTimeout(function(){t.classList.remove("bt-show")},tip?3500:2600);
+}
+var _f=window.fetch;
+if(typeof _f==="function"){
+  window.fetch=async function(){
+    var res=await _f.apply(this,arguments);
+    try{
+      var u=typeof arguments[0]==="string"?arguments[0]:(arguments[0]&&arguments[0].url)||"";
+      if(u.indexOf("lottery_home_detail")!==-1){
+        var m=u.match(/[?&]lottery_id=([^&#]+)/);
+        if(m&&m[1]&&Number(m[1])!==0)curActiveLotteryId=String(m[1]);
+      }
+      if(u.indexOf("garb/v2/mall/suit/detail")!==-1||u.indexOf("garb/v2/user/suit/benefit")!==-1){
+        res.clone().json().then(function(j){
+          var d=j&&j.data;if(!d)return;
+          var si=d.suit_items||{};var sk=Array.isArray(si.skin)?si.skin[0]:si.skin;
+          var id=(sk&&sk.item_id)||d.item_id;
+          var allIds=[d.item_id,sk&&sk.item_id,si.space_bg&&si.space_bg[0]&&si.space_bg[0].item_id].filter(Boolean).join("&");
+          var spBg=Array.isArray(si.space_bg)?si.space_bg[0]:si.space_bg;
+          var spImages=[];
+          if(spBg&&spBg.properties){
+            for(var pi=1;pi<=12;pi++){
+              var port=spBg.properties["image"+pi+"_portrait"];
+              if(port&&spImages.indexOf(port)===-1)spImages.push(port);
+            }
+          }
+          var splashes=spImages.map(function(iu,idx){
+            return {url:iu,hash:"",size:0,name:(d.name||"个性装扮")+" #"+(idx+1),isPortrait:true};
+          });
+          if(id){
+            cur={
+              suit_id:String(d.item_id||""),
+              item_id:String(id),
+              ids:allIds||String(id),
+              name:d.name||(sk&&sk.name)||"个性装扮",
+              cover:(d.properties&&d.properties.image_cover)||(sk&&sk.properties&&sk.properties.image_cover)||"",
+              splashes:splashes.length>0?splashes:null
+            };
+          }
+        }).catch(function(){})
+      }
+    }catch(e){}
+    return res;
+  };
+}
+
+async function handleInject(){
+  var p=new URLSearchParams(window.location.search);
+  var act=p.get("act_id");var id=p.get("id");
+  var suit=null;
+  if(act){
+    toast("正在识别当前卡池装扮…","");
+    try{
+      var activeEl=document.querySelector(".tab-item.active,.tab-item[class*='active'],[class*='tab'][class*='active']");
+      var activeTitle=(activeEl?activeEl.textContent:"").trim();
+      var tabIdx=-1;
+      if(activeEl&&activeEl.parentNode){
+        var allTabs=Array.prototype.slice.call(activeEl.parentNode.children);
+        tabIdx=allTabs.indexOf(activeEl);
+      }
+      var r=await _f("https://api.bilibili.com/x/vas/dlc_act/asset_bag?act_id="+act).then(function(x){return x.json()});
+      var d=r&&r.data;
+      var cl=(d&&d.collect_list)||[];
+      var sl=((d&&d.lottery_simple_list)||[]).filter(function(x){return Number(x&&x.lottery_id)!==0});
+      var matchedLottery=null;
+      if(curActiveLotteryId){
+        matchedLottery=sl.find(function(x){return String(x&&x.lottery_id)===String(curActiveLotteryId)});
+      }
+      if(!matchedLottery&&sl.length>0){
+        var tabs=document.querySelectorAll(".van-tab--active,.tab-item.active,[class*='tab--active'],[class*='tab'][class*='active']");
+        for(var ti=0;ti<tabs.length;ti++){
+          var txt=(tabs[ti].textContent||"").trim();
+          if(!txt)continue;
+          var found=sl.find(function(x){return x&&x.lottery_name&&(txt.indexOf(x.lottery_name)!==-1||x.lottery_name.indexOf(txt)!==-1)});
+          if(found){matchedLottery=found;break;}
+        }
+      }
+      if(!matchedLottery){
+        var urlLid=p.get("lottery_id");
+        if(urlLid&&Number(urlLid)!==0){
+          matchedLottery=sl.find(function(x){return String(x&&x.lottery_id)===String(urlLid)});
+        }
+      }
+      if(!matchedLottery&&sl.length>0){
+        matchedLottery=sl[0];
+      }
+      var target=null;
+      if(matchedLottery){
+        var mLid=String(matchedLottery.lottery_id);
+        var mName=matchedLottery.lottery_name||"";
+        target=cl.find(function(x){
+          return Number(x&&x.redeem_item_type)===5&&String(x&&x.lottery_id)===mLid;
+        });
+        if(!target&&mName){
+          target=cl.find(function(x){
+            if(Number(x&&x.redeem_item_type)!==5)return false;
+            var rName=x.redeem_item_name||x.name||"";
+            return rName.indexOf(mName)!==-1||mName.indexOf(rName)!==-1;
+          });
+        }
+      }
+      if(!target){
+        target=cl.find(function(x){return Number(x&&x.redeem_item_type)===5});
+      }
+      var splashes=[];
+      var isMultiLottery=((d&&d.lottery_simple_list)||[]).filter(function(x){return Number(x&&x.lottery_id)!==0}).length>1;
+      for(var ci=0;ci<cl.length;ci++){
+        var c=cl[ci];
+        var sp=c&&c.card_item&&c.card_item.card_type_info&&c.card_item.card_type_info.splash;
+        var fs=sp&&sp.resource&&sp.resource.full_size;
+        if(fs&&fs.thumb){
+          var cLid=String((c&&c.lottery_id)||"");
+          var cName=c.redeem_item_name||c.name||"";
+          var isMatching=false;
+          if(isMultiLottery&&matchedLottery){
+            var mLid=String(matchedLottery.lottery_id);
+            var mName=matchedLottery.lottery_name||"";
+            isMatching=(cLid===mLid)||(mName&&(cName.indexOf(mName)!==-1||mName.indexOf(cName)!==-1));
+          }else{
+            isMatching=cLid==="0"||!cLid||(matchedLottery&&
