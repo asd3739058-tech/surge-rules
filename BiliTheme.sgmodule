@@ -1,0 +1,14 @@
+#!name=哔哩主题 (BiliTheme)
+#!desc=B站装扮商城详情页原生衣服图标一键注入主题皮肤、加载动画、开屏与空间头图。
+#!system=ios
+
+[Script]
+# API 持久化存储脚本 (负责保存你的装扮设置)
+哔哩主题API = type=http-request, pattern=^https:\/\/app\.bilibili\.com\/settings\/theme\/api\/(select|config), requires-body=1, max-size=0, script-path=https://raw.githubusercontent.com/chaoscard/bili-theme/main/dist/bili-theme.panel.js
+
+# 核心响应注入脚本 (负责下发装扮数据)
+# 这里的 argument="spaceBg=true,splashBg=true" 表示强制同时开启空间头图和开屏装扮
+哔哩主题响应 = type=http-response, pattern=^https:\/\/(www\.bilibili\.com\/h5\/mall\/(digital-card\/home|suit\/detail)|app\.bilibili\.com\/x\/(resource\/show\/skin|v2\/(space|splash\/brand\/list))), requires-body=1, max-size=0, argument="spaceBg=true,splashBg=true", script-path=https://raw.githubusercontent.com/chaoscard/bili-theme/main/dist/bili-theme.response.js
+
+[MITM]
+hostname = %APPEND% app.bilibili.com, www.bilibili.com
