@@ -6,7 +6,7 @@
 # type=http-response 表示在接收到服务器响应时触发
 # pattern 匹配 B 站请求个人信息的 URL
 # requires-body=1 表示我们需要获取并修改响应体
-# script-path 指向你的脚本位置 (这里假设脚本和模块放在同一个目录下)
+# ⁠script-path=[https://raw.githubusercontent.com/asd3739058-tech/surge-rules/refs/heads/main/bili_vip.js]
 B站画质解锁 = type=http-response, pattern=^https:\/\/app\.bilibili\.com\/x\/v2\/account\/myinfo, requires-body=1, max-size=0, script-path=bili_vip.js
 
 [MITM]
